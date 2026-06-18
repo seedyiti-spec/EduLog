@@ -414,14 +414,25 @@ def _rt(text: str) -> list:
     return [{"text": {"content": text[i: i + 1999]}} for i in range(0, max(len(text), 1), 1999)]
 
 
-def send_to_notion(journal: dict, token: str, database_id: str):
+def send_to_notion(journal: dict, token: str, database_id: str, class_name_override: str = ""):
     nc = NotionClient(auth=token)
     a = journal["analysis"]
     director_memo = journal.get("director_realtime_memo", "")
+
+    # 5단계 폴백: 인자 → journal dict → current_class → nav_class_name → classes 조회
+    resolved_class = (
+        class_name_override.strip()
+        or journal.get("class_name", "").strip()
+        or (st.session_state.get("current_class") or {}).get("name", "").strip()
+        or st.session_state.get("nav_class_name", "").strip()
+        or load_classes().get(journal.get("class_id", ""), {}).get("name", "").strip()
+        or "미분류"
+    )
+
     properties = {
         "이름": {"title": _rt(journal["child_name"])},
         "날짜": {"date": {"start": journal["date"]}},
-        "클래스": {"select": {"name": journal["class_name"]}},
+        "클래스": {"select": {"name": resolved_class}},
         "주요 발화 및 관찰 내용": {"rich_text": _rt(a.get("key_observations", ""))},
         "아이가 쓴 글의 내용 요약": {"rich_text": _rt(a.get("writing_summary", ""))},
         "선생님의 피드백 내용": {"rich_text": _rt(a.get("teacher_feedback", ""))},
@@ -629,7 +640,7 @@ def render_upload_tab(class_id: str, class_name: str, keys: dict):
                 "id": str(uuid.uuid4()),
                 "child_name": child_name,
                 "class_id": class_id,
-                "class_name": result["class_name"],
+                "class_name": class_name,
                 "date": result["date"],
                 "transcript": "",
                 "analysis": analysis,
@@ -649,8 +660,14 @@ def render_upload_tab(class_id: str, class_name: str, keys: dict):
         "Notion 일괄 전송", use_container_width=True, disabled=not notion_ready,
         help="Streamlit Secrets에 NOTION_TOKEN / NOTION_DATABASE_ID를 설정해 주세요." if not notion_ready else "",
     ):
-        current_class = st.session_state.get("current_class") or {}
-        active_class_name = current_class.get("name") or result.get("class_name", class_name)
+        # class_name 강제 확정 — 함수 파라미터가 1순위, 세션/조회가 폴백
+        active_class_name = (
+            class_name.strip()
+            or (st.session_state.get("current_class") or {}).get("name", "").strip()
+            or st.session_state.get("nav_class_name", "").strip()
+            or load_classes().get(class_id, {}).get("name", "").strip()
+            or "미분류"
+        )
 
         cdata_fresh = load_class_data(class_id)
         sent = []
@@ -678,7 +695,12 @@ def render_upload_tab(class_id: str, class_name: str, keys: dict):
             }
             try:
                 with st.spinner(f"{child_name} 전송 중…"):
-                    send_to_notion(journal, keys["NOTION_TOKEN"], keys["NOTION_DATABASE_ID"])
+                    send_to_notion(
+                        journal,
+                        keys["NOTION_TOKEN"],
+                        keys["NOTION_DATABASE_ID"],
+                        class_name_override=active_class_name,
+                    )
                 cdata_fresh["journals"].append(journal)
                 sent.append(child_name)
             except Exception as exc:
@@ -845,8 +867,21 @@ def render_journals_tab(class_id: str, keys: dict):
                     disabled=not notion_ready, use_container_width=True,
                 ):
                     try:
+                        # 저장된 일지의 class_name이 비어 있을 경우를 대비한 강제 폴백
+                        effective_class = (
+                            jn.get("class_name", "").strip()
+                            or (st.session_state.get("current_class") or {}).get("name", "").strip()
+                            or st.session_state.get("nav_class_name", "").strip()
+                            or load_classes().get(class_id, {}).get("name", "").strip()
+                            or "미분류"
+                        )
                         with st.spinner("전송 중…"):
-                            send_to_notion(jn, keys["NOTION_TOKEN"], keys["NOTION_DATABASE_ID"])
+                            send_to_notion(
+                                jn,
+                                keys["NOTION_TOKEN"],
+                                keys["NOTION_DATABASE_ID"],
+                                class_name_override=effective_class,
+                            )
                         for j in cdata["journals"]:
                             if j["id"] == jn["id"]:
                                 j["sent_to_notion"] = True
