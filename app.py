@@ -1,3 +1,4 @@
+import hashlib
 import html as _html
 import json
 import os
@@ -190,9 +191,7 @@ hr { border-color: #E0DDD6 !important; margin: 2rem 0 !important; }
 # ── Constants ─────────────────────────────────────────────────────────────────
 DATA_DIR = "data"
 CLASSES_FILE = os.path.join(DATA_DIR, "classes.json")
-
 GEMINI_MODEL = "gemini-2.5-flash"
-
 MIME_MAP = {
     ".mp3": "audio/mpeg", ".mp4": "audio/mp4", ".m4a": "audio/mp4",
     ".wav": "audio/wav", ".webm": "audio/webm", ".ogg": "audio/ogg",
@@ -200,26 +199,153 @@ MIME_MAP = {
 }
 
 
-# ── Key access via st.secrets ─────────────────────────────────────────────────
 def get_keys() -> dict:
     return {
-        "GEMINI_API_KEY":    st.secrets.get("GEMINI_API_KEY", ""),
-        "NOTION_TOKEN":      st.secrets.get("NOTION_TOKEN", ""),
+        "GEMINI_API_KEY":     st.secrets.get("GEMINI_API_KEY", ""),
+        "NOTION_TOKEN":       st.secrets.get("NOTION_TOKEN", ""),
         "NOTION_DATABASE_ID": st.secrets.get("NOTION_DATABASE_ID", ""),
     }
+
+
+# ── Notion: Class & Journal Discovery ────────────────────────────────────────
+def fetch_classes_from_notion(token: str, database_id: str) -> dict:
+    """Query the Notion DB for distinct class names; return as a classes dict."""
+    nc = NotionClient(auth=token)
+    classes: dict = {}
+    cursor = None
+    while True:
+        params: dict = {"database_id": database_id, "page_size": 100}
+        if cursor:
+            params["start_cursor"] = cursor
+        try:
+            resp = nc.databases.query(**params)
+        except Exception:
+            break
+        for page in resp.get("results", []):
+            sel = (page["properties"].get("클래스") or {}).get("select") or {}
+            name = (sel.get("name") or "").strip()
+            if not name:
+                continue
+            cid = hashlib.md5(name.encode()).hexdigest()[:8]
+            if cid not in classes:
+                classes[cid] = {
+                    "id": cid, "name": name,
+                    "description": "", "created_at": "",
+                    "from_notion": True,
+                }
+        if not resp.get("has_more"):
+            break
+        cursor = resp.get("next_cursor")
+    return classes
+
+
+def fetch_journals_from_notion(class_name: str, token: str, database_id: str) -> list:
+    """Fetch all Notion pages whose 클래스 select equals class_name."""
+    nc = NotionClient(auth=token)
+    journals: list = []
+    cursor = None
+    while True:
+        params: dict = {
+            "database_id": database_id,
+            "filter": {"property": "클래스", "select": {"equals": class_name}},
+            "page_size": 100,
+        }
+        if cursor:
+            params["start_cursor"] = cursor
+        try:
+            resp = nc.databases.query(**params)
+        except Exception:
+            break
+        for page in resp.get("results", []):
+            props = page["properties"]
+
+            def _rt(key: str) -> str:
+                parts = (props.get(key) or {}).get("rich_text") or []
+                return "".join(p.get("text", {}).get("content", "") for p in parts)
+
+            def _title() -> str:
+                parts = (props.get("이름") or {}).get("title") or []
+                return "".join(p.get("text", {}).get("content", "") for p in parts)
+
+            def _date_val() -> str:
+                d = (props.get("날짜") or {}).get("date") or {}
+                return d.get("start", "")
+
+            journals.append({
+                "id": page["id"],
+                "child_name": _title(),
+                "class_name": class_name,
+                "date": _date_val(),
+                "transcript": "",
+                "analysis": {
+                    "key_observations": _rt("주요 발화 및 관찰 내용"),
+                    "writing_summary":  _rt("아이가 쓴 글의 내용 요약"),
+                    "teacher_feedback": _rt("선생님의 피드백 내용"),
+                },
+                "director_realtime_memo": _rt("디렉터 메모"),
+                "sent_to_notion": True,
+                "from_notion": True,
+                "created_at": page.get("created_time", ""),
+            })
+        if not resp.get("has_more"):
+            break
+        cursor = resp.get("next_cursor")
+    return journals
+
+
+def _ensure_notion_journals(class_id: str, class_name: str, keys: dict):
+    """Fetch Notion journals once per session, merge into session_state."""
+    cache_key = f"_notion_jloaded_{class_id}"
+    if st.session_state.get(cache_key):
+        return
+    if not (keys.get("NOTION_TOKEN") and keys.get("NOTION_DATABASE_ID") and class_name):
+        return
+    try:
+        notion_jn = fetch_journals_from_notion(
+            class_name, keys["NOTION_TOKEN"], keys["NOTION_DATABASE_ID"]
+        )
+        if "class_data" not in st.session_state:
+            st.session_state.class_data = {}
+        cdata = st.session_state.class_data.setdefault(
+            class_id, {"children": [], "journals": []}
+        )
+        notion_ids = {j["id"] for j in notion_jn}
+        local_only = [
+            j for j in cdata.get("journals", [])
+            if j.get("id") not in notion_ids and not j.get("from_notion")
+        ]
+        cdata["journals"] = notion_jn + local_only
+        st.session_state[cache_key] = True
+    except Exception:
+        pass
 
 
 # ── Session state initialisation ──────────────────────────────────────────────
 def _init_session_state():
     if "classes" not in st.session_state:
+        classes: dict = {}
         try:
             if os.path.exists(CLASSES_FILE):
                 with open(CLASSES_FILE, "r", encoding="utf-8") as f:
-                    st.session_state.classes = json.load(f)
-            else:
-                st.session_state.classes = {}
+                    classes = json.load(f)
         except Exception:
-            st.session_state.classes = {}
+            pass
+
+        # Auto-discover classes from Notion so server restarts don't wipe the list
+        keys = get_keys()
+        if keys["NOTION_TOKEN"] and keys["NOTION_DATABASE_ID"]:
+            try:
+                notion_cls = fetch_classes_from_notion(
+                    keys["NOTION_TOKEN"], keys["NOTION_DATABASE_ID"]
+                )
+                existing_names = {c["name"] for c in classes.values()}
+                for cid, cls in notion_cls.items():
+                    if cls["name"] not in existing_names:
+                        classes[cid] = cls
+            except Exception:
+                pass
+
+        st.session_state.classes = classes
 
     if "class_data" not in st.session_state:
         st.session_state.class_data = {}
@@ -228,7 +354,7 @@ def _init_session_state():
         st.session_state.current_class = None
 
 
-# ── Data helpers (session_state-backed, file I/O as best-effort) ──────────────
+# ── Data helpers ──────────────────────────────────────────────────────────────
 def load_classes() -> dict:
     return st.session_state.get("classes", {})
 
@@ -251,7 +377,6 @@ def load_class_data(class_id: str) -> dict:
     class_data_store = st.session_state.get("class_data", {})
     if class_id in class_data_store:
         return class_data_store[class_id]
-    # Fallback: read from file (local dev or initial cloud load)
     try:
         path = class_data_path(class_id)
         if os.path.exists(path):
@@ -292,11 +417,10 @@ def render_sidebar():
 
         st.markdown("<hr style='margin:1rem 0; border-color:#C8C5BE;'>", unsafe_allow_html=True)
 
-        # Connection status dots
         keys = get_keys()
         statuses = [
-            ("Gemini",  bool(keys["GEMINI_API_KEY"])),
-            ("Notion",  bool(keys["NOTION_TOKEN"] and keys["NOTION_DATABASE_ID"])),
+            ("Gemini", bool(keys["GEMINI_API_KEY"])),
+            ("Notion", bool(keys["NOTION_TOKEN"] and keys["NOTION_DATABASE_ID"])),
         ]
         for name, ok in statuses:
             dot   = "#2D6A4F" if ok else "#C8C5BE"
@@ -310,7 +434,7 @@ def render_sidebar():
             </div>""", unsafe_allow_html=True)
 
 
-# ── Gemini: speaker diarisation + class-wide analysis ─────────────────────────
+# ── Gemini: audio speaker diarisation ─────────────────────────────────────────
 def _build_class_prompt(class_name: str, obs_date: str, num_students: int) -> str:
     letters = [chr(ord('A') + i) for i in range(num_students)]
     labels = [f"학생 {l}" for l in letters]
@@ -360,7 +484,6 @@ def analyze_class_with_gemini(
     audio_file, api_key: str, class_name: str, obs_date: str, num_students: int = 4
 ) -> list:
     client = genai.Client(api_key=api_key)
-
     suffix = os.path.splitext(audio_file.name)[-1].lower() or ".m4a"
     mime_type = MIME_MAP.get(suffix, "audio/mpeg")
 
@@ -374,7 +497,6 @@ def analyze_class_with_gemini(
             file=tmp_path,
             config=types.UploadFileConfig(mime_type=mime_type),
         )
-
         max_wait_sec = 600
         waited = 0
         while uploaded.state.name not in ("ACTIVE", "FAILED"):
@@ -399,7 +521,6 @@ def analyze_class_with_gemini(
         text = response.text
         m = re.search(r"\[.*\]", text, re.DOTALL)
         return json.loads(m.group() if m else text)
-
     finally:
         os.unlink(tmp_path)
         if uploaded:
@@ -409,7 +530,43 @@ def analyze_class_with_gemini(
                 pass
 
 
-# ── Notion integration ────────────────────────────────────────────────────────
+# ── Gemini: text memo → structured journal ────────────────────────────────────
+def _build_text_memo_prompt(class_name: str, obs_date: str, memo_text: str) -> str:
+    return (
+        f"당신은 어린이 글쓰기 수업 전문 관찰 일지 작성 AI입니다.\n"
+        f"아래는 '{class_name}' 수업 {obs_date}의 선생님 현장 메모입니다.\n\n"
+        f"=== 메모 원문 ===\n{memo_text}\n=== 끝 ===\n\n"
+        f"임무: 이 메모를 바탕으로 매거진 B 스타일의 품격 있는 관찰 일지를 작성하세요.\n\n"
+        f"규칙:\n"
+        f"1. 메모에 특정 학생 이름이 언급된 경우, 학생별로 항목을 분리하세요.\n"
+        f"2. 학생이 명확히 구분되지 않으면 speaker를 '수업 전체'로 하는 단일 항목을 만드세요.\n"
+        f"3. 각 항목의 내용은 원문 정보를 충실히 담되, 매거진 B 특유의 절제되고 우아한 문체로 다듬으세요.\n"
+        f"   불필요한 미사여구 없이, 핵심적이고 관찰적인 언어를 사용하세요.\n"
+        f"4. 메모에 없는 내용은 임의로 추가하지 마세요.\n\n"
+        f"반드시 아래 JSON 배열 형식으로만 응답하세요. 다른 텍스트는 절대 포함하지 마세요.\n"
+        f'[{{"speaker": "학생 이름 또는 수업 전체", '
+        f'"key_observations": "주요 발화 및 관찰 내용", '
+        f'"writing_summary": "아이가 쓴 글의 내용 요약", '
+        f'"teacher_feedback": "선생님의 피드백 내용"}}]'
+    )
+
+
+def analyze_text_memo_with_gemini(
+    memo_text: str, api_key: str, class_name: str, obs_date: str
+) -> list:
+    client = genai.Client(api_key=api_key)
+    prompt = _build_text_memo_prompt(class_name, obs_date, memo_text)
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(response_mime_type="application/json"),
+    )
+    text = response.text
+    m = re.search(r"\[.*\]", text, re.DOTALL)
+    return json.loads(m.group() if m else text)
+
+
+# ── Notion: send page ─────────────────────────────────────────────────────────
 def _rt(text: str) -> list:
     return [{"text": {"content": text[i: i + 1999]}} for i in range(0, max(len(text), 1), 1999)]
 
@@ -419,7 +576,6 @@ def send_to_notion(journal: dict, token: str, database_id: str, class_name_overr
     a = journal["analysis"]
     director_memo = journal.get("director_realtime_memo", "")
 
-    # 5단계 폴백: 인자 → journal dict → current_class → nav_class_name → classes 조회
     resolved_class = (
         class_name_override.strip()
         or journal.get("class_name", "").strip()
@@ -430,13 +586,13 @@ def send_to_notion(journal: dict, token: str, database_id: str, class_name_overr
     )
 
     properties = {
-        "이름": {"title": _rt(journal["child_name"])},
-        "날짜": {"date": {"start": journal["date"]}},
-        "클래스": {"select": {"name": resolved_class}},
+        "이름":                  {"title": _rt(journal["child_name"])},
+        "날짜":                  {"date": {"start": journal["date"]}},
+        "클래스":                {"select": {"name": resolved_class}},
         "주요 발화 및 관찰 내용": {"rich_text": _rt(a.get("key_observations", ""))},
         "아이가 쓴 글의 내용 요약": {"rich_text": _rt(a.get("writing_summary", ""))},
-        "선생님의 피드백 내용": {"rich_text": _rt(a.get("teacher_feedback", ""))},
-        "디렉터 메모": {"rich_text": _rt(director_memo)},
+        "선생님의 피드백 내용":   {"rich_text": _rt(a.get("teacher_feedback", ""))},
+        "디렉터 메모":           {"rich_text": _rt(director_memo)},
     }
     transcript = journal.get("transcript", "")
     blocks = [{"object": "block", "type": "heading_2",
@@ -481,9 +637,9 @@ def mag_analysis_block(index: int, label: str, content: str):
 
 
 _ANALYSIS_FIELDS = [
-    ("주요 발화 및 관찰 내용",  "key_observations"),
+    ("주요 발화 및 관찰 내용",   "key_observations"),
     ("아이가 쓴 글의 내용 요약", "writing_summary"),
-    ("선생님의 피드백 내용",    "teacher_feedback"),
+    ("선생님의 피드백 내용",     "teacher_feedback"),
 ]
 
 
@@ -492,75 +648,25 @@ def render_analysis_card(analysis: dict):
         mag_analysis_block(i, label, analysis.get(key, "—"))
 
 
-# ── Tab 1: Upload & Analysis ──────────────────────────────────────────────────
-def render_upload_tab(class_id: str, class_name: str, keys: dict):
-    mag_section_title("Record & Analyse")
-
-    cdata = load_class_data(class_id)
-    children = cdata.get("children", [])
-    child_options = ["미지정"] + [c["name"] for c in children]
-
-    col1, col2 = st.columns(2)
-    with col1:
-        mag_label("수업 날짜")
-        obs_date = st.date_input("수업 날짜", value=date.today(), label_visibility="collapsed")
-    with col2:
-        mag_label("참여 학생 수")
-        num_students = st.number_input(
-            "참여 학생 수",
-            min_value=1, max_value=10, value=4, step=1,
-            label_visibility="collapsed",
-            help="실제 수업에 참여한 학생 수를 입력하세요 (1~10명). AI가 이 숫자에 맞게 화자를 분리합니다.",
-        )
-
-    st.markdown("<div style='margin-top:1.5rem;'>", unsafe_allow_html=True)
-    mag_label("음성 파일 업로드 — mp3 / m4a / wav / mp4 / webm / ogg / flac")
-    audio_file = st.file_uploader(
-        "음성 파일", type=["mp3", "m4a", "wav", "mp4", "webm", "ogg", "flac", "aac"],
-        label_visibility="collapsed",
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    if audio_file:
-        st.audio(audio_file)
-        st.markdown("<div style='margin-top:1rem;'>", unsafe_allow_html=True)
-        if st.button("Analyse →", type="primary"):
-            if not keys["GEMINI_API_KEY"]:
-                st.error("Streamlit Secrets에 GEMINI_API_KEY가 설정되지 않았습니다.")
-            else:
-                with st.status("Gemini 분석 중…", expanded=True) as status:
-                    try:
-                        st.write("— 음성 파일을 Gemini에 업로드 중")
-                        audio_file.seek(0)
-                        st.write("— 화자 분리 및 관찰 일지 생성 중 (파일 크기에 따라 수 분 소요될 수 있습니다)")
-                        speakers = analyze_class_with_gemini(
-                            audio_file, keys["GEMINI_API_KEY"],
-                            class_name, str(obs_date),
-                            int(num_students),
-                        )
-                        status.update(label="완료", state="complete")
-                        st.session_state["_class_result"] = {
-                            "speakers": speakers,
-                            "class_id": class_id,
-                            "class_name": class_name,
-                            "date": str(obs_date),
-                        }
-                    except Exception as exc:
-                        status.update(label="오류", state="error")
-                        st.error(f"오류 상세 내용: {exc}")
-        st.markdown("</div>", unsafe_allow_html=True)
-
+# ── Shared: result display + save/send ────────────────────────────────────────
+def _render_result_section(class_id: str, class_name: str, keys: dict):
+    """Shared UI for speaker mapping, analysis cards, and batch save/send."""
     result = st.session_state.get("_class_result")
     if not (result and result.get("class_id") == class_id):
         return
 
     speakers = result["speakers"]
+    source   = result.get("source", "audio")
+
+    cdata = load_class_data(class_id)
+    children = cdata.get("children", [])
+    child_options = ["미지정"] + [c["name"] for c in children]
 
     st.markdown(f"""
     <div style="margin-top:3rem; padding-top:2rem; border-top:2px solid #1A1A1A;">
         <div style="font-size:0.62rem; font-weight:600; letter-spacing:0.18em;
                     text-transform:uppercase; color:#888; margin-bottom:0.6rem;">
-            Speaker Diarisation Result
+            {"Speaker Diarisation Result" if source == "audio" else "Gemini 가공 결과"}
         </div>
         <div style="display:flex; align-items:baseline; gap:1.5rem;">
             <span style="font-family:'DM Serif Display',serif; font-size:2rem;
@@ -570,30 +676,42 @@ def render_upload_tab(class_id: str, class_name: str, keys: dict):
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Name mapping ─────────────────────────────────────────────────────────
+    # Name mapping
     mag_section_title("화자 매핑 — 학생 이름 지정")
     st.markdown("""
     <div style="font-size:0.82rem; color:#888; font-weight:300; margin-bottom:1.5rem; line-height:1.7;">
-        Gemini가 목소리 특성으로 구분한 학생 A–F에 실제 이름을 지정하세요.<br>
+        Gemini가 구분한 화자에 실제 이름을 지정하세요.<br>
         '미지정' 항목은 저장에서 제외됩니다.
     </div>
     """, unsafe_allow_html=True)
 
     map_cols = st.columns(3)
     for i, sp in enumerate(speakers):
-        label = sp["speaker"]
+        label   = sp["speaker"]
         map_key = f"_map_{class_id}_{label.replace(' ', '_')}"
+        # Pre-select if the speaker name matches a registered child
+        default_idx = 0
+        if label in [c["name"] for c in children]:
+            try:
+                default_idx = child_options.index(label)
+            except ValueError:
+                default_idx = 0
         with map_cols[i % 3]:
             mag_label(label)
-            st.selectbox(label, child_options, key=map_key, label_visibility="collapsed")
+            st.selectbox(
+                label, child_options,
+                index=default_idx,
+                key=map_key,
+                label_visibility="collapsed",
+            )
 
-    # ── Analysis cards ────────────────────────────────────────────────────────
+    # Analysis cards
     mag_section_title("분석 결과")
     for sp in speakers:
-        label = sp["speaker"]
-        map_key = f"_map_{class_id}_{label.replace(' ', '_')}"
-        mapped = st.session_state.get(map_key, "미지정")
-        display = f"{label}  ·  {mapped}" if mapped != "미지정" else label
+        label    = sp["speaker"]
+        map_key  = f"_map_{class_id}_{label.replace(' ', '_')}"
+        mapped   = st.session_state.get(map_key, "미지정")
+        display  = f"{label}  ·  {mapped}" if mapped != "미지정" else label
         analysis = {k: v for k, v in sp.items() if k != "speaker"}
         memo_key = f"_memo_{class_id}_{label.replace(' ', '_')}"
         with st.expander(display):
@@ -613,34 +731,41 @@ def render_upload_tab(class_id: str, class_name: str, keys: dict):
             """, unsafe_allow_html=True)
             st.text_area(
                 "디렉터 실시간 메모",
-                placeholder="예) 오늘 유독 집중력이 좋았고, '사과가 빨간 건 부끄러워서'라는 표현이 인상적이었음. 다음 시간에 색깔의 감정 연결하는 활동 제안해볼 것.",
+                placeholder="예) 오늘 유독 집중력이 좋았고, '사과가 빨간 건 부끄러워서'라는 표현이 인상적이었음.",
                 key=memo_key,
                 label_visibility="collapsed",
                 height=130,
             )
 
-    # ── Batch save / send ─────────────────────────────────────────────────────
+    # Batch save / send
     st.markdown("<div style='margin-top:2rem;'>", unsafe_allow_html=True)
     notion_ready = bool(keys["NOTION_TOKEN"] and keys["NOTION_DATABASE_ID"])
+    active_class_name = (
+        class_name.strip()
+        or (st.session_state.get("current_class") or {}).get("name", "").strip()
+        or st.session_state.get("nav_class_name", "").strip()
+        or load_classes().get(class_id, {}).get("name", "").strip()
+        or "미분류"
+    )
     sc1, sc2 = st.columns(2)
 
     if sc1.button("일괄 저장", use_container_width=True):
         cdata_fresh = load_class_data(class_id)
         saved = []
         for sp in speakers:
-            label = sp["speaker"]
-            map_key = f"_map_{class_id}_{label.replace(' ', '_')}"
+            label      = sp["speaker"]
+            map_key    = f"_map_{class_id}_{label.replace(' ', '_')}"
             child_name = st.session_state.get(map_key, "미지정")
             if child_name == "미지정":
                 continue
-            analysis = {k: v for k, v in sp.items() if k != "speaker"}
-            memo_key = f"_memo_{class_id}_{label.replace(' ', '_')}"
+            analysis   = {k: v for k, v in sp.items() if k != "speaker"}
+            memo_key   = f"_memo_{class_id}_{label.replace(' ', '_')}"
             director_memo = st.session_state.get(memo_key, "")
             journal = {
                 "id": str(uuid.uuid4()),
                 "child_name": child_name,
                 "class_id": class_id,
-                "class_name": class_name,
+                "class_name": active_class_name,
                 "date": result["date"],
                 "transcript": "",
                 "analysis": analysis,
@@ -660,26 +785,17 @@ def render_upload_tab(class_id: str, class_name: str, keys: dict):
         "Notion 일괄 전송", use_container_width=True, disabled=not notion_ready,
         help="Streamlit Secrets에 NOTION_TOKEN / NOTION_DATABASE_ID를 설정해 주세요." if not notion_ready else "",
     ):
-        # class_name 강제 확정 — 함수 파라미터가 1순위, 세션/조회가 폴백
-        active_class_name = (
-            class_name.strip()
-            or (st.session_state.get("current_class") or {}).get("name", "").strip()
-            or st.session_state.get("nav_class_name", "").strip()
-            or load_classes().get(class_id, {}).get("name", "").strip()
-            or "미분류"
-        )
-
         cdata_fresh = load_class_data(class_id)
         sent = []
         errors = []
         for sp in speakers:
-            label = sp["speaker"]
-            map_key = f"_map_{class_id}_{label.replace(' ', '_')}"
+            label      = sp["speaker"]
+            map_key    = f"_map_{class_id}_{label.replace(' ', '_')}"
             child_name = st.session_state.get(map_key, "미지정")
             if child_name == "미지정":
                 continue
-            analysis = {k: v for k, v in sp.items() if k != "speaker"}
-            memo_key = f"_memo_{class_id}_{label.replace(' ', '_')}"
+            analysis      = {k: v for k, v in sp.items() if k != "speaker"}
+            memo_key      = f"_memo_{class_id}_{label.replace(' ', '_')}"
             director_memo = st.session_state.get(memo_key, "")
             journal = {
                 "id": str(uuid.uuid4()),
@@ -707,12 +823,129 @@ def render_upload_tab(class_id: str, class_name: str, keys: dict):
                 errors.append(f"{child_name}: {exc}")
         if sent:
             save_class_data(class_id, cdata_fresh)
+            # Invalidate Notion journal cache so archive reflects new entries
+            st.session_state.pop(f"_notion_jloaded_{class_id}", None)
             st.success(f"Notion 전송 완료: {', '.join(sent)}")
         for e in errors:
             st.error(e)
         if not sent and not errors:
             st.warning("전송할 항목이 없습니다. 이름을 지정해 주세요.")
     st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ── Tab 1: Upload & Analysis ──────────────────────────────────────────────────
+def render_upload_tab(class_id: str, class_name: str, keys: dict):
+    mag_section_title("Record & Analyse")
+
+    mag_label("수업 날짜")
+    obs_date = st.date_input("수업 날짜", value=date.today(), label_visibility="collapsed")
+
+    # ── 방법 1: 음성 파일 ─────────────────────────────────────────────────────
+    st.markdown("""
+    <div style="margin:2.5rem 0 1rem 0; padding:0.6rem 1rem;
+                background:#F2F0EB; border-left:3px solid #1A1A1A;">
+        <span style="font-size:0.68rem; font-weight:600; letter-spacing:0.14em;
+                     text-transform:uppercase; color:#555;">방법 1 — 음성 파일 분석</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    mag_label("참여 학생 수")
+    num_students = st.number_input(
+        "참여 학생 수",
+        min_value=1, max_value=10, value=4, step=1,
+        label_visibility="collapsed",
+        help="실제 수업에 참여한 학생 수를 입력하세요 (1~10명). AI가 이 숫자에 맞게 화자를 분리합니다.",
+    )
+
+    st.markdown("<div style='margin-top:1rem;'>", unsafe_allow_html=True)
+    mag_label("음성 파일 업로드 — mp3 / m4a / wav / mp4 / webm / ogg / flac")
+    audio_file = st.file_uploader(
+        "음성 파일", type=["mp3", "m4a", "wav", "mp4", "webm", "ogg", "flac", "aac"],
+        label_visibility="collapsed",
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if audio_file:
+        st.audio(audio_file)
+        st.markdown("<div style='margin-top:1rem;'>", unsafe_allow_html=True)
+        if st.button("Analyse →", type="primary", key=f"_audio_analyse_{class_id}"):
+            if not keys["GEMINI_API_KEY"]:
+                st.error("Streamlit Secrets에 GEMINI_API_KEY가 설정되지 않았습니다.")
+            else:
+                with st.status("Gemini 분석 중…", expanded=True) as status:
+                    try:
+                        st.write("— 음성 파일을 Gemini에 업로드 중")
+                        audio_file.seek(0)
+                        st.write("— 화자 분리 및 관찰 일지 생성 중 (파일 크기에 따라 수 분 소요될 수 있습니다)")
+                        speakers = analyze_class_with_gemini(
+                            audio_file, keys["GEMINI_API_KEY"],
+                            class_name, str(obs_date),
+                            int(num_students),
+                        )
+                        status.update(label="완료", state="complete")
+                        st.session_state["_class_result"] = {
+                            "speakers":   speakers,
+                            "class_id":   class_id,
+                            "class_name": class_name,
+                            "date":       str(obs_date),
+                            "source":     "audio",
+                        }
+                    except Exception as exc:
+                        status.update(label="오류", state="error")
+                        st.error(f"오류 상세 내용: {exc}")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── 방법 2: 직접 메모 입력 ────────────────────────────────────────────────
+    st.markdown("""
+    <div style="margin:2.5rem 0 1rem 0; padding:0.6rem 1rem;
+                background:#F2F0EB; border-left:3px solid #1A1A1A;">
+        <span style="font-size:0.68rem; font-weight:600; letter-spacing:0.14em;
+                     text-transform:uppercase; color:#555;">방법 2 — 오늘의 수업 메모 직접 입력</span>
+    </div>
+    <div style="font-size:0.82rem; color:#888; font-weight:300; margin-bottom:1rem; line-height:1.7;">
+        음성 파일 없이 텍스트로 수업 내용을 입력하면, Gemini가 매거진 B 스타일의
+        우아한 관찰 일지로 가공합니다.<br>
+        학생 이름을 메모에 직접 언급하면 학생별로 자동 분리됩니다.
+    </div>
+    """, unsafe_allow_html=True)
+
+    mag_label("수업 메모")
+    text_memo = st.text_area(
+        "수업 메모",
+        placeholder=(
+            "예) 오늘 수업에서 민준이는 '강이 말을 할 수 있다면'이라는 소재로 글을 썼다. "
+            "강물이 돌에게 속삭이는 장면이 인상적이었고, 디렉터는 의인화 표현이 자연스럽다고 칭찬했다. "
+            "서연이는 첫 문장을 어떻게 시작할지 오래 고민했고, 결국 질문 형식으로 시작하기로 했다..."
+        ),
+        height=220,
+        label_visibility="collapsed",
+        key=f"_text_memo_{class_id}",
+    )
+
+    if text_memo.strip():
+        if st.button("Gemini로 가공 →", type="primary", key=f"_text_analyse_{class_id}"):
+            if not keys["GEMINI_API_KEY"]:
+                st.error("Streamlit Secrets에 GEMINI_API_KEY가 설정되지 않았습니다.")
+            else:
+                with st.spinner("Gemini가 메모를 관찰 일지로 가공 중…"):
+                    try:
+                        speakers = analyze_text_memo_with_gemini(
+                            text_memo, keys["GEMINI_API_KEY"],
+                            class_name, str(obs_date),
+                        )
+                        st.session_state["_class_result"] = {
+                            "speakers":   speakers,
+                            "class_id":   class_id,
+                            "class_name": class_name,
+                            "date":       str(obs_date),
+                            "source":     "text",
+                        }
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"오류 상세 내용: {exc}")
+
+    # ── Shared result display ─────────────────────────────────────────────────
+    _render_result_section(class_id, class_name, keys)
 
 
 # ── Tab 2: Child Management ───────────────────────────────────────────────────
@@ -783,9 +1016,20 @@ def render_children_tab(class_id: str):
                 st.rerun()
 
 
-# ── Tab 3: Journal List ───────────────────────────────────────────────────────
+# ── Tab 3: Journal Archive ────────────────────────────────────────────────────
 def render_journals_tab(class_id: str, keys: dict):
     mag_section_title("Journal Archive")
+
+    # Auto-load from Notion (once per session)
+    class_name = (st.session_state.get("current_class") or {}).get("name", "")
+    _ensure_notion_journals(class_id, class_name, keys)
+
+    # Refresh button
+    col_title, col_refresh = st.columns([5, 1])
+    with col_refresh:
+        if st.button("Notion 새로고침", use_container_width=True, key=f"_refresh_jn_{class_id}"):
+            st.session_state.pop(f"_notion_jloaded_{class_id}", None)
+            st.rerun()
 
     cdata = load_class_data(class_id)
     journals = cdata.get("journals", [])
@@ -798,7 +1042,7 @@ def render_journals_tab(class_id: str, keys: dict):
         </div>""", unsafe_allow_html=True)
         return
 
-    child_names = sorted({j["child_name"] for j in journals})
+    child_names = sorted({j["child_name"] for j in journals if j.get("child_name")})
     fc1, fc2 = st.columns(2)
     with fc1:
         mag_label("아이 필터")
@@ -814,7 +1058,7 @@ def render_journals_tab(class_id: str, keys: dict):
         filtered = [j for j in filtered if j.get("sent_to_notion")]
     elif filter_notion == "미전송":
         filtered = [j for j in filtered if not j.get("sent_to_notion")]
-    filtered = sorted(filtered, key=lambda x: x["date"], reverse=True)
+    filtered = sorted(filtered, key=lambda x: x.get("date", ""), reverse=True)
 
     st.markdown(f"""
     <div style="font-size:0.72rem; color:#888; letter-spacing:0.06em; margin:1.5rem 0 1rem 0;">
@@ -824,17 +1068,21 @@ def render_journals_tab(class_id: str, keys: dict):
     notion_ready = bool(keys["NOTION_TOKEN"] and keys["NOTION_DATABASE_ID"])
 
     for jn in filtered:
-        sent = jn.get("sent_to_notion")
+        sent        = jn.get("sent_to_notion")
         badge_color = "#2D6A4F" if sent else "#BBBBBB"
         badge_text  = "전송됨" if sent else "미전송"
+        from_notion = jn.get("from_notion", False)
 
-        with st.expander(f"{jn['child_name']}  ·  {jn['date']}"):
+        with st.expander(f"{jn['child_name']}  ·  {jn.get('date', '')}"):
             st.markdown(f"""
-            <div style="display:inline-block; font-size:0.6rem; font-weight:600;
-                        letter-spacing:0.14em; text-transform:uppercase;
-                        color:{badge_color}; border:1px solid {badge_color};
-                        padding:0.15rem 0.5rem; margin-bottom:1rem;">
-                {badge_text}
+            <div style="display:flex; gap:0.6rem; align-items:center; margin-bottom:1rem;">
+                <div style="display:inline-block; font-size:0.6rem; font-weight:600;
+                            letter-spacing:0.14em; text-transform:uppercase;
+                            color:{badge_color}; border:1px solid {badge_color};
+                            padding:0.15rem 0.5rem;">
+                    {badge_text}
+                </div>
+                {"<div style='display:inline-block; font-size:0.6rem; font-weight:600; letter-spacing:0.14em; text-transform:uppercase; color:#7D6AB0; border:1px solid #7D6AB0; padding:0.15rem 0.5rem;'>Notion</div>" if from_notion else ""}
             </div>""", unsafe_allow_html=True)
 
             render_analysis_card(jn["analysis"])
@@ -867,7 +1115,6 @@ def render_journals_tab(class_id: str, keys: dict):
                     disabled=not notion_ready, use_container_width=True,
                 ):
                     try:
-                        # 저장된 일지의 class_name이 비어 있을 경우를 대비한 강제 폴백
                         effective_class = (
                             jn.get("class_name", "").strip()
                             or (st.session_state.get("current_class") or {}).get("name", "").strip()
@@ -886,6 +1133,7 @@ def render_journals_tab(class_id: str, keys: dict):
                             if j["id"] == jn["id"]:
                                 j["sent_to_notion"] = True
                         save_class_data(class_id, cdata)
+                        st.session_state.pop(f"_notion_jloaded_{class_id}", None)
                         st.success("전송되었습니다.")
                         st.rerun()
                     except Exception as exc:
@@ -896,10 +1144,11 @@ def render_journals_tab(class_id: str, keys: dict):
                     ✓ Notion 전송 완료
                 </div>""", unsafe_allow_html=True)
 
-            if jc2.button("삭제", key=f"del_jn_{jn['id']}", use_container_width=True):
-                cdata["journals"] = [j for j in cdata["journals"] if j["id"] != jn["id"]]
-                save_class_data(class_id, cdata)
-                st.rerun()
+            if not from_notion:
+                if jc2.button("삭제", key=f"del_jn_{jn['id']}", use_container_width=True):
+                    cdata["journals"] = [j for j in cdata["journals"] if j["id"] != jn["id"]]
+                    save_class_data(class_id, cdata)
+                    st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -943,16 +1192,17 @@ def render_home():
             if fc1.form_submit_button("추가", use_container_width=True):
                 name = name_input.strip()
                 if name:
-                    cid = str(uuid.uuid4())[:8]
-                    new_class = {
-                        "id": cid, "name": name,
-                        "description": desc_input.strip(),
-                        "created_at": datetime.now().isoformat(),
-                    }
-                    classes[cid] = new_class
-                    save_classes(classes)
-                    # Pre-populate empty class data in session_state
-                    st.session_state.class_data[cid] = {"children": [], "journals": []}
+                    # Use MD5-based ID so it's stable and matches future Notion discovery
+                    cid = hashlib.md5(name.encode()).hexdigest()[:8]
+                    if cid not in classes:
+                        new_class = {
+                            "id": cid, "name": name,
+                            "description": desc_input.strip(),
+                            "created_at": datetime.now().isoformat(),
+                        }
+                        classes[cid] = new_class
+                        save_classes(classes)
+                        st.session_state.class_data[cid] = {"children": [], "journals": []}
                     st.session_state.pop("_show_add_class", None)
                     st.rerun()
                 else:
@@ -975,15 +1225,22 @@ def render_home():
     cols = st.columns(min(3, len(classes)))
     for idx, (cid, cls) in enumerate(classes.items()):
         with cols[idx % 3]:
-            cdata = load_class_data(cid)
-            n_ch = len(cdata["children"])
-            n_jo = len(cdata["journals"])
-            _name = _html.escape(cls['name'])
-            _raw_desc = cls.get('description', '')
-            _desc = _html.escape(_raw_desc) if _raw_desc else '&nbsp;'
+            cdata  = load_class_data(cid)
+            n_ch   = len(cdata["children"])
+            n_jo   = len(cdata["journals"])
+            _name  = _html.escape(cls["name"])
+            _raw_desc = cls.get("description", "")
+            _desc  = _html.escape(_raw_desc) if _raw_desc else "&nbsp;"
+            notion_badge = (
+                '<div style="font-size:0.55rem; font-weight:600; letter-spacing:0.12em; '
+                'text-transform:uppercase; color:#7D6AB0; border:1px solid #7D6AB0; '
+                'display:inline-block; padding:0.1rem 0.4rem; margin-bottom:0.6rem;">Notion 연동</div>'
+                if cls.get("from_notion") else ""
+            )
             st.markdown(
                 f'<div style="border:1px solid #E0DDD6; padding:1.8rem 1.6rem 1.2rem 1.6rem;'
                 f'background:#FAF9F6; margin-bottom:1rem;">'
+                f'{notion_badge}'
                 f'<div style="font-size:0.6rem; font-weight:600; letter-spacing:0.16em;'
                 f'text-transform:uppercase; color:#AAAAAA; margin-bottom:0.6rem;">Class</div>'
                 f'<div style="font-family:\'DM Serif Display\',serif; font-size:1.4rem;'
@@ -998,9 +1255,9 @@ def render_home():
             )
             c_open, c_del = st.columns([3, 1])
             if c_open.button("열기", key=f"open_{cid}", use_container_width=True):
-                st.session_state["nav_class_id"] = cid
+                st.session_state["nav_class_id"]   = cid
                 st.session_state["nav_class_name"] = cls["name"]
-                st.session_state["current_class"] = {"id": cid, "name": cls["name"]}
+                st.session_state["current_class"]  = {"id": cid, "name": cls["name"]}
                 st.rerun()
             if c_del.button("삭제", key=f"del_cls_{cid}", use_container_width=True):
                 st.session_state["_confirm_del_class"] = cid
@@ -1008,7 +1265,7 @@ def render_home():
     st.markdown("</div>", unsafe_allow_html=True)
 
     if "_confirm_del_class" in st.session_state:
-        cid = st.session_state["_confirm_del_class"]
+        cid   = st.session_state["_confirm_del_class"]
         cname = classes.get(cid, {}).get("name", "")
         st.warning(f"'{cname}' 클래스를 삭제하시겠습니까? 모든 일지 데이터가 삭제됩니다.")
         cc1, cc2 = st.columns(2)
